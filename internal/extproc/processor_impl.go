@@ -635,7 +635,11 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessRespo
 		u.metrics.RecordTokenUsage(ctx, u.costs, u.requestHeaders)
 	}
 
-	if body.EndOfStream && (len(u.parent.config.GlobalRequestCosts) > 0 || len(u.parent.config.RequestCosts) > 0) {
+	// Build dynamic metadata as soon as the accumulated usage changes (i.e. the chunk that carries
+	// the usage payload), not only at end-of-stream. This ensures the access log still captures usage
+	// even if the downstream client disconnects right after the terminal chunk, before EndOfStream
+	// is observed by the extproc. The EndOfStream write below remains as the final refresh.
+	if (body.EndOfStream || !tokenUsage.IsZero()) && (len(u.parent.config.GlobalRequestCosts) > 0 || len(u.parent.config.RequestCosts) > 0) {
 		metadata, err := buildDynamicMetadata(u.parent.config.GlobalRequestCosts, u.parent.config.RequestCosts, &u.costs, u.requestHeaders, u.backendName, u.routeName, responseModel)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build dynamic metadata: %w", err)
@@ -917,8 +921,9 @@ func evalRuntimeRequestCost(rc *filterapi.RuntimeRequestCost, costs *metrics.Tok
 }
 
 // buildDynamicMetadata creates metadata for rate limiting and cost tracking.
-// This function is called by the upstream filter only at the end of the stream (body.EndOfStream=true)
-// when the response is successfully completed. It is not called for failed requests or partial responses.
+// This function is called by the upstream filter at the end of the stream (body.EndOfStream=true), and,
+// for streaming responses, also as soon as a chunk carries new usage so the access log still captures it
+// if the downstream client disconnects before EndOfStream is observed. It is not called for failed requests.
 // The metadata includes token usage costs and model information for downstream processing.
 // Two-tier precedence: for each metadataKey, check route-scoped requestCosts first (matching RouteName == routeName).
 // If found, use it. Otherwise, fall back to globalRequestCosts. If neither exists, the key is not emitted.
@@ -928,10 +933,7 @@ func buildDynamicMetadata(globalRequestCosts []filterapi.RuntimeGlobalRequestCos
 	// Track which metadata keys have been populated by route-scoped costs.
 	populatedKeys := make(map[string]struct{})
 
-	shortBackend := backendName
-	if parts := strings.SplitN(backendName, "/", 3); len(parts) >= 2 {
-		shortBackend = parts[0] + "/" + parts[1]
-	}
+	shortBackend := internalapi.AIServiceBackendName(backendName)
 
 	actualModel := requestHeaders[internalapi.ModelNameHeaderKeyDefault]
 
@@ -975,16 +977,9 @@ func buildDynamicMetadata(globalRequestCosts []filterapi.RuntimeGlobalRequestCos
 		// backend_name itself is emitted by buildBackendDynamicMetadata in the request
 		// headers phase, so it is already on the stream by the time this runs.
 		//
-		// ai_service_backend_name stores the short "namespace/name" format extracted
-		// from the full PerRouteRuleRefBackendName ("{namespace}/{name}/route/...").
-		// This is used by the quota rate limit descriptor actions to match the
-		// rate limit service config which keys on "namespace/backendName".
-		parts := strings.SplitN(backendName, "/", 3)
-		shortName := backendName
-		if len(parts) >= 2 {
-			shortName = parts[0] + "/" + parts[1]
-		}
-		metadata["ai_service_backend_name"] = &structpb.Value{Kind: &structpb.Value_StringValue{StringValue: shortName}}
+		// ai_service_backend_name stores the short "namespace/name" format, which the quota
+		// rate limit descriptor actions match against the rate limit service config.
+		metadata["ai_service_backend_name"] = &structpb.Value{Kind: &structpb.Value_StringValue{StringValue: shortBackend}}
 	}
 	if routeName != "" {
 		metadata["route_name"] = &structpb.Value{Kind: &structpb.Value_StringValue{StringValue: routeName}}
